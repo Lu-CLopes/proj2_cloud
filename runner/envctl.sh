@@ -1,165 +1,204 @@
-#!/usr/bin/env bash
-#
-# envctl.sh — controlador dos ambientes de execução (executado como root via sudo).
-#
-# ============================================================================
-#  VERSÃO STUB — executa o programa SEM cgroups e SEM namespaces.
-#  Serve para a interface web funcionar de ponta a ponta enquanto a parte de
-#  isolamento é desenvolvida. A implementação real (cgroups v2 + namespaces)
-#  fica na branch feature/cgroups-namespaces e deve respeitar o mesmo contrato.
-# ============================================================================
-#
-# Contrato usado pela aplicação web (app/runner.php):
-#
-#   envctl.sh start  <id> <cpu%> <mem_mb> <io_r_mbps> <io_w_mbps> <net 0|1>
-#         -> stdout: "started <pid>"           rc=0 em sucesso
-#   envctl.sh status <id>
-#         -> stdout: uma das linhas
-#              running <pid>
-#              exited <rc> [oom]
-#              stopped <rc>
-#              lost                            (sem processo e sem código de saída)
-#              unknown                         (ambiente nunca iniciado)
-#   envctl.sh stop   <id>      -> "stopped"
-#   envctl.sh remove <id>      -> "removed"   (para, apaga cgroup e arquivos)
-#   envctl.sh info   <id>      -> linhas "chave=valor" com métricas do ambiente
-#
-# Arquivos:
-#   /var/lib/proj2/jobs/<id>/run.sh    gerado pela aplicação web (www-data)
-#   /var/lib/proj2/envs/<id>/          diretório do ambiente (root)
-#        job/        cópia somente-leitura do job
-#        work/       diretório de trabalho do programa (usuário proj2run)
-#        output.log  stdout + stderr do programa
-#        exit_code, supervisor.pid, main.pid, stopped, params
-#
-set -uo pipefail
+#!/bin/bash
 
-BASE=/var/lib/proj2
-JOBS=$BASE/jobs
-ENVS=$BASE/envs
-RUN_USER=proj2run
-SAFE_PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-SELF=$(readlink -f "$0")
+# ---------
+# envctl.sh 
+# ---------
 
-umask 022
+# Script utilizado para gerenciamento de ambientes de execução de processos, utilizando cgroups e namespaces.
+# Não é necessário rodar comandos com sudo, pois o script já é rodado com privilégios de root.
 
-die()  { echo "erro: $*" >&2; exit 1; }
-uint() { [[ "${1:-}" =~ ^[0-9]+$ ]] || die "valor numérico inválido: '${1:-}'"; }
+CMD=$1
+ID=$2
 
-envdir() { echo "$ENVS/$1"; }
+if [ "$#" -lt 2 ]; then
+    echo "Uso: $0 <comando> <id> [<args>]"
+    exit 1
+fi
 
-pid_alive() { [ -n "${1:-}" ] && kill -0 "$1" 2>/dev/null; }
+CG="/sys/fs/cgroup/proj2/env-$ID"
+ENV_DIR="/var/lib/proj2/envs/$ID"
 
-supervisor_alive() {
-    local d; d=$(envdir "$1")
-    [ -f "$d/supervisor.pid" ] || return 1
-    local p; p=$(cat "$d/supervisor.pid")
-    pid_alive "$p" && grep -qa "_supervise" "/proc/$p/cmdline" 2>/dev/null
-}
-
-# ---------------------------------------------------------------------------
-# start
-# ---------------------------------------------------------------------------
-cmd_start() {
-    local id=$1 cpu=$2 mem=$3 rbps=$4 wbps=$5 net=$6
-    for v in "$id" "$cpu" "$mem" "$rbps" "$wbps" "$net"; do uint "$v"; done
-    [ -f "$JOBS/$id/run.sh" ] || die "job $id não encontrado em $JOBS/$id"
-    supervisor_alive "$id" && die "ambiente $id já está em execução"
-
-    local d; d=$(envdir "$id")
-    rm -rf "$d"
-    mkdir -p "$d/job" "$d/work"
-    cp -a "$JOBS/$id/." "$d/job/"
-    chown -R root:root "$d/job" && chmod -R a+rX,go-w "$d/job"
-    chown "$RUN_USER:$RUN_USER" "$d/work"
-    : > "$d/output.log"
-    printf 'cpu=%s\nmem=%s\nrbps=%s\nwbps=%s\nnet=%s\n' "$cpu" "$mem" "$rbps" "$wbps" "$net" > "$d/params"
-
-    # Processo supervisor desacoplado (nova sessão) para não prender o PHP.
-    setsid -f "$SELF" _supervise "$id" </dev/null >/dev/null 2>&1
-
-    for _ in $(seq 50); do
-        [ -s "$d/main.pid" ] && break
-        sleep 0.1
-    done
-    [ -s "$d/main.pid" ] || die "o supervisor não iniciou"
-    echo "started $(cat "$d/main.pid")"
-}
-
-# Supervisor: inicia o programa, espera terminar e grava o código de saída.
-cmd_supervise() {
-    local id=$1 d; d=$(envdir "$id")
-    echo $$ > "$d/supervisor.pid"
-    echo "[envctl] $(date '+%F %T') ambiente $id iniciado (STUB: sem cgroups/namespaces)" >> "$d/output.log"
+# ---------------------------------------------------------
+# COMANDOS INTERNOS (não chamados pelo PHP)
+# ---------------------------------------------------------
+if [ "$CMD" == "_supervise" ]; then
+    NET=$3
+    mkdir -p /sys/fs/cgroup/proj2/supervisor
+    echo "$$" > /sys/fs/cgroup/proj2/supervisor/cgroup.procs
+    echo "$$" > "$ENV_DIR/supervisor.pid"
 
     (
-        cd "$d/work" || exit 126
-        # setsid: o programa vira líder do próprio grupo, para o stop matar o grupo todo
-        exec setsid setpriv --reuid="$RUN_USER" --regid="$RUN_USER" --init-groups --no-new-privs \
-            env -i PATH="$SAFE_PATH" HOME="$d/work" JOB_DIR="$d/job" ENV_ID="$id" \
-            /bin/bash "$d/job/run.sh"
-    ) >> "$d/output.log" 2>&1 &
-    local child=$!
-    echo "$child" > "$d/main.pid"
+        echo "$BASHPID" > "$CG/cgroup.procs"
+        echo "$BASHPID" > "$ENV_DIR/main.pid"
+        exec unshare --pid --fork --kill-child \
+                     --mount --mount-proc \
+                     --uts --ipc \
+                     $( [ "$NET" = 1 ] && echo --net ) \
+             -- /bin/bash /opt/proj2_cloud/runner/envctl.sh _inner "$ID" "$NET"
+    ) >> "$ENV_DIR/output.log" 2>&1 &
 
-    wait "$child"
-    local rc=$?
-    echo "$rc" > "$d/exit_code"
-    echo "[envctl] $(date '+%F %T') processo terminou com código $rc" >> "$d/output.log"
-}
+    MAIN_PID=$!
+    wait $MAIN_PID
+    echo $? > "$ENV_DIR/exit_code"
+    exit 0
+fi
 
-# ---------------------------------------------------------------------------
-# status / info
-# ---------------------------------------------------------------------------
-cmd_status() {
-    local id=$1 d; d=$(envdir "$id")
-    [ -d "$d" ] || { echo unknown; return; }
-    if [ -f "$d/exit_code" ]; then
-        local rc; rc=$(cat "$d/exit_code")
-        if [ -f "$d/stopped" ]; then echo "stopped $rc"; else echo "exited $rc"; fi
-    elif supervisor_alive "$id"; then
-        echo "running $(cat "$d/main.pid" 2>/dev/null)"
+if [ "$CMD" == "_inner" ]; then
+    NET=$3
+    hostname "env-$ID"
+    mount -t tmpfs -o size=64m,mode=1777 tmpfs /tmp
+    [ "$NET" = 1 ] && ip link set lo up
+
+    cd "$ENV_DIR/work"
+    exec setpriv --reuid=proj2run --regid=proj2run --init-groups \
+                 --inh-caps=-all --bounding-set=-all --no-new-privs \
+         env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$ENV_DIR/work" \
+                JOB_DIR="$ENV_DIR/job" ENV_ID="$ID" \
+         /bin/bash "$ENV_DIR/job/run.sh"
+    exit 0
+fi
+
+# ---------------------------------------------------------
+# API EXTERNA (chamadas pelo PHP)
+# ---------------------------------------------------------
+
+# |----------|
+# | 1) start |
+# |----------|
+if [ "$CMD" == "start" ]; then
+    if [ "$#" -ne 7 ]; then
+        echo "Falha ao iniciar: Número incorreto de argumentos"
+        exit 1
+    fi
+
+    CPU=$3
+    MEM=$4
+    IO_R=$5
+    IO_W=$6
+    NET=$7
+
+    # verificar valores
+    if [ "$CPU" -lt 5 ] || [ "$CPU" -gt 100 ]; then echo "Falha ao iniciar: CPU % fora do limite, [5-100]"; exit 1; fi
+    if [ "$MEM" -lt 16 ] || [ "$MEM" -gt 2048 ]; then echo "Falha ao iniciar: Memória MB fora do limite, [16-2048]"; exit 1; fi
+    if [ "$NET" -ne 0 ] && [ "$NET" -ne 1 ]; then echo "Falha ao iniciar: Rede inválida, [0-1]"; exit 1; fi
+
+    # preparar diretórios e copiar arquivos por segurança
+    mkdir -p "$ENV_DIR/work" "$ENV_DIR/job" /sys/fs/cgroup/proj2
+    chown -R proj2run:proj2run "$ENV_DIR/work"  # permite o usuário criar arquivos
+    echo "+cpu +memory +io +pids" > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null
+    echo "+cpu +memory +io +pids" > /sys/fs/cgroup/proj2/cgroup.subtree_control 2>/dev/null
+    cp -r "/var/lib/proj2/jobs/$ID/"* "$ENV_DIR/job/" 2>/dev/null
+    chmod -R 755 "$ENV_DIR/job"
+    touch "$ENV_DIR/output.log"
+    chmod 0644 "$ENV_DIR/output.log"
+
+    # criar cgroups e aplicar limites
+    mkdir -p "$CG"
+    echo "$((CPU * 1000)) 100000" > "$CG/cpu.max"
+    echo "$((MEM * 1024 * 1024))" > "$CG/memory.max"
+    echo 0 > "$CG/memory.swap.max"
+    echo 512 > "$CG/pids.max"
+
+    if [ "$IO_R" -gt 0 ] || [ "$IO_W" -gt 0 ]; then
+        TARGET_MNT=$(findmnt -no SOURCE --target /var/lib/proj2)
+        DISK_NAME=$(lsblk -no PKNAME "$TARGET_MNT" | head -n1)
+        [ -z "$DISK_NAME" ] && DISK_NAME=$(basename "$TARGET_MNT" | head -n1)
+        MAJMIN=$(lsblk -dno MAJ:MIN "/dev/$DISK_NAME" 2>/dev/null | head -n1)
+        [ -z "$MAJMIN" ] && MAJMIN="8:0"
+
+        [ "$IO_R" -eq 0 ] && R_LIMIT="max" || R_LIMIT=$((IO_R * 1024 * 1024))
+        [ "$IO_W" -eq 0 ] && W_LIMIT="max" || W_LIMIT=$((IO_W * 1024 * 1024))
+
+        echo "$MAJMIN rbps=$R_LIMIT wbps=$W_LIMIT" > "$CG/io.max" 2>/dev/null
+    fi
+
+    # iniciar Supervisor desacoplado do PHP e sudo
+    setsid -f /opt/proj2_cloud/runner/envctl.sh _supervise "$ID" "$NET" >/dev/null 2>&1
+
+    # aguardar até o processo isolado escrever o main.pid (até 5s)
+    for i in {1..50}; do
+        if [ -f "$ENV_DIR/main.pid" ]; then
+            echo "started $(cat "$ENV_DIR/main.pid")"
+            exit 0
+        fi
+        sleep 0.1
+    done
+    
+    echo "Falha ao iniciar: timeout aguardando a criação do main.pid"
+    exit 1
+
+# |-----------|
+# | 2) status |
+# |-----------|
+elif [ "$CMD" == "status" ]; then
+    if [ ! -d "$ENV_DIR" ]; then
+        echo "unknown"
+        exit 0
+    fi
+
+    if [ -f "$ENV_DIR/exit_code" ]; then
+        RC=$(cat "$ENV_DIR/exit_code")
+        if [ -f "$ENV_DIR/stopped" ]; then
+            echo "stopped $RC"
+        else
+            OOM=""
+            if [ -f "$CG/memory.events" ]; then
+                OOM_KILL=$(grep -E '^oom_kill ' "$CG/memory.events" | awk '{print $2}')
+                if [ -n "$OOM_KILL" ] && [ "$OOM_KILL" -gt 0 ]; then OOM=" oom"; fi
+            fi
+            echo "exited $RC$OOM"
+        fi
+    elif [ -f "$ENV_DIR/supervisor.pid" ] && kill -0 $(cat "$ENV_DIR/supervisor.pid") 2>/dev/null; then
+        if [ -f "$ENV_DIR/main.pid" ]; then echo "running $(cat "$ENV_DIR/main.pid")"
+        else echo "running $(cat "$ENV_DIR/supervisor.pid")"; fi
     else
-        echo lost
+        echo "lost"
     fi
-}
+    exit 0
 
-cmd_info() {
-    local id=$1
-    echo "modo=stub (sem cgroups/namespaces)"
-    echo "status=$(cmd_status "$id")"
-}
-
-# ---------------------------------------------------------------------------
-# stop / remove
-# ---------------------------------------------------------------------------
-cmd_stop() {
-    local id=$1 d; d=$(envdir "$id")
-    if supervisor_alive "$id"; then
-        touch "$d/stopped"
-        local pg; pg=$(cat "$d/main.pid")
-        kill -TERM -- "-$pg" 2>/dev/null
-        for _ in $(seq 30); do pid_alive "$pg" || break; sleep 0.1; done
-        kill -KILL -- "-$pg" 2>/dev/null
-        for _ in $(seq 50); do [ -f "$d/exit_code" ] && break; sleep 0.1; done
+# |---------|
+# | 3) stop |
+# |---------|
+elif [ "$CMD" == "stop" ]; then
+    touch "$ENV_DIR/stopped" 2>/dev/null
+    if [ -d "$CG" ]; then
+        for p in $(cat "$CG/cgroup.procs" 2>/dev/null); do kill -TERM "$p" 2>/dev/null; done
+        sleep 3
+        echo 1 > "$CG/cgroup.kill" 2>/dev/null
     fi
-    echo stopped
-}
+    echo "stopped"
+    exit 0
 
-cmd_remove() {
-    local id=$1
-    cmd_stop "$id" >/dev/null
-    rm -rf "$(envdir "$id")" "${JOBS:?}/$id"
-    echo removed
-}
+# |-----------|
+# | 4) remove |
+# |-----------|
+elif [ "$CMD" == "remove" ]; then
+    /opt/proj2_cloud/runner/envctl.sh stop "$ID" >/dev/null 2>&1
+    sleep 1
+    if [ -d "$CG" ]; then rmdir "$CG" 2>/dev/null; fi
+    
+    rm -rf "/var/lib/proj2/envs/$ID"
+    rm -rf "/var/lib/proj2/jobs/$ID"
 
-# ---------------------------------------------------------------------------
-[ "$(id -u)" -eq 0 ] || die "execute como root (sudo)"
-action=${1:-}; shift || true
-case "$action" in
-    start)      [ $# -eq 6 ] || die "uso: $0 start <id> <cpu%> <mem_mb> <io_r> <io_w> <net>"; cmd_start "$@" ;;
-    _supervise) uint "${1:-}"; cmd_supervise "$1" ;;
-    status|info|stop|remove)
-                [ $# -eq 1 ] || die "uso: $0 $action <id>"; uint "$1"; "cmd_$action" "$1" ;;
-    *)          die "uso: $0 {start|status|stop|remove|info} ..." ;;
-esac
+    echo "removed"
+    exit 0
+
+# |---------|
+# | 5) info |
+# |---------|
+elif [ "$CMD" == "info" ]; then
+    if [ ! -d "${CG}" ]; then
+        echo "Erro: O cgroup do ambiente $ID não existe"
+        exit 1
+    fi
+    echo "cpu.max=$(cat "$CG/cpu.max" 2>/dev/null)"
+    echo "memory.current=$(cat "$CG/memory.current" 2>/dev/null)"
+    echo "memory.max=$(cat "$CG/memory.max" 2>/dev/null)"
+    echo "pids.current=$(cat "$CG/pids.current" 2>/dev/null)"
+    echo "ns.pid=pid:[$(cat "$CG/cgroup.procs" 2>/dev/null | tr '\n' ',' | sed 's/,$//')]"
+    exit 0
+
+else
+    echo "Erro: Comando inválido. Use start, status, stop, remove ou info."
+    exit 1
+fi
